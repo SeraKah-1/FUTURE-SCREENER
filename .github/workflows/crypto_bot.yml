@@ -1,0 +1,33 @@
+name: Crypto OMB Screener
+
+on:
+  schedule:
+    # Jalan setiap 30 menit (di menit ke-0 dan ke-30)
+    - cron: '0,30 * * * *'
+  
+  workflow_dispatch: # Supaya bisa di-klik Run manual untuk tes
+
+jobs:
+  run-screener:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Screener
+        env:
+          # Mengambil kunci rahasia dari GitHub Settings
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python main.py
