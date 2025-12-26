@@ -2,5 +2,3 @@ ccxt
 pandas
 requests
 numpy
-tabulate
-fake-useragent
