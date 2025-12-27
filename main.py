@@ -11,15 +11,19 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 # Parameter Screening
-TOP_VOL_COUNT = 35       # Scan 35 Koin dengan volume terbesar (Top Liquidity)
+TOP_VOL_COUNT = 35       # Scan 35 Koin dengan volume terbesar
 LIMIT_CANDLE = 200       # Minimal candle untuk akurasi EMA 200
 TF_MACRO = '1h'          # Timeframe Trend
 TF_MICRO = '15m'         # Timeframe Trigger (OI & Entry)
 
-# Exchange Setup (Binance Futures)
-exchange = ccxt.binance({
+# --- EXCHANGE SETUP: BYBIT (Lebih Aman dari Blokir IP) ---
+print("🔌 Connecting to Bybit Futures...")
+exchange = ccxt.bybit({
     'enableRateLimit': True,
-    'options': {'defaultType': 'future'}
+    'options': {
+        'defaultType': 'linear',  # Linear = USDT Perpetuals
+        'adjustForTimeDifference': True
+    }
 })
 
 # --- HELPER FUNCTIONS ---
@@ -27,7 +31,7 @@ exchange = ccxt.binance({
 def send_telegram(message):
     """Mengirim pesan ke Telegram"""
     if not TELEGRAM_TOKEN:
-        print("⚠️ Telegram Token not found!")
+        print("⚠️ Telegram Token not found! Printing to console only.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
@@ -43,17 +47,28 @@ def send_telegram(message):
 
 def get_top_liquid_pairs():
     """Mengambil Top 35 Pair berdasarkan Volume USDT"""
-    print("🔍 Scanning Market Liquidity...")
+    print("🔍 Scanning Market Liquidity (Bybit)...")
     try:
+        # Fetch tickers
         tickers = exchange.fetch_tickers()
-        sorted_tickers = sorted(tickers.items(), key=lambda x: x[1].get('quoteVolume', 0), reverse=True)
         
-        targets = []
-        for symbol, data in sorted_tickers:
-            if '/USDT' in symbol and 'USDC' not in symbol: # Filter Stablecoin pair
-                targets.append(symbol)
-                if len(targets) >= TOP_VOL_COUNT:
-                    break
+        # Format Data untuk Sorting
+        valid_pairs = []
+        for symbol, data in tickers.items():
+            # Filter hanya USDT Perpetual, abaikan USDC atau Spot
+            # Di Bybit symbol futures biasanya formatnya BTC/USDT:USDT
+            if '/USDT' in symbol and 'USDC' not in symbol:
+                vol = data.get('quoteVolume', 0)
+                if vol is None: vol = 0
+                valid_pairs.append((symbol, vol))
+        
+        # Sort dari volume terbesar
+        sorted_tickers = sorted(valid_pairs, key=lambda x: x[1], reverse=True)
+        
+        # Ambil Top N
+        targets = [pair[0] for pair in sorted_tickers[:TOP_VOL_COUNT]]
+        
+        print(f"✅ Loaded {len(targets)} Top Pairs.")
         return targets
     except Exception as e:
         print(f"❌ Error fetching tickers: {e}")
@@ -91,6 +106,8 @@ def fetch_and_analyze(symbol):
     try:
         # 1. Fetch Data 1H (Macro Trend)
         ohlcv_1h = exchange.fetch_ohlcv(symbol, TF_MACRO, limit=LIMIT_CANDLE)
+        if not ohlcv_1h: return None
+        
         df_1h = pd.DataFrame(ohlcv_1h, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
         df_1h = calculate_indicators(df_1h)
         last_1h = df_1h.iloc[-1]
@@ -108,24 +125,24 @@ def fetch_and_analyze(symbol):
             bias = "BEARISH"
             trend_score = 40
             
-        # Jika Sideways/Messy, langsung Skip (Efisiensi)
+        # Jika Sideways/Messy, langsung Skip
         if trend_score == 0:
             return None
 
-        # 3. Fetch Data 15m (Micro Trigger & OI)
-        # Note: OI History di fetch manual via OHLCV proxy atau fetch khusus jika didukung.
-        # Disini kita pakai logic Volume & Price Action 15m sebagai konfirmasi.
+        # 3. Fetch Data 15m (Micro Trigger)
         ohlcv_15m = exchange.fetch_ohlcv(symbol, TF_MICRO, limit=50)
         df_15m = pd.DataFrame(ohlcv_15m, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
         df_15m = calculate_indicators(df_15m)
         last_15m = df_15m.iloc[-1]
         
-        # Fetch Real OI & Funding (Snapshot)
+        # Fetch Real Funding & Proxy OI
         try:
             ticker_data = exchange.fetch_ticker(symbol)
-            funding_rate = float(ticker_data.get('info', {}).get('lastFundingRate', 0))
-            # Simulasi OI Change (Karena history OI berat di API public)
-            # Kita pakai Volume Spike sebagai proxy Smart Money masuk
+            # CCXT Unified Field untuk Funding Rate (Lebih stabil di Bybit)
+            funding_rate = ticker_data.get('fundingRate', 0)
+            if funding_rate is None: funding_rate = 0
+            
+            # Simulasi OI/Smart Money via Volume Spike
             oi_proxy_score = 0
             vol_ratio = last_15m['volume'] / last_15m['Vol_SMA']
             
@@ -160,6 +177,9 @@ def fetch_and_analyze(symbol):
         atr_val = last_15m['ATR']
         sl_price = 0
         
+        # Clean Symbol Name (Remove :USDT suffix if exists for display)
+        clean_symbol = symbol.split(':')[0]
+
         if bias == "BULLISH":
             sl_price = last_15m['low'] - (1.5 * atr_val)
             side = "LONG 🟢"
@@ -168,7 +188,7 @@ def fetch_and_analyze(symbol):
             side = "SHORT 🔴"
 
         return {
-            'symbol': symbol,
+            'symbol': clean_symbol,
             'side': side,
             'price': last_15m['close'],
             'score': total_score,
@@ -185,11 +205,16 @@ def fetch_and_analyze(symbol):
 # --- MAIN ENGINE ---
 
 def run_screener():
-    print("🚀 Starting Tier-List Screener...")
+    print("🚀 Starting Tier-List Screener (Bybit Edition)...")
     targets = get_top_liquid_pairs()
+    
+    if not targets:
+        print("❌ No targets found. Check connection.")
+        return
+
     results = []
 
-    # Parallel Execution biar Cepat
+    # Parallel Execution
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(fetch_and_analyze, pair) for pair in targets]
         for future in futures:
@@ -212,7 +237,7 @@ def run_screener():
     current_tier = ""
     
     for r in results:
-        # Header Tier (Hanya print sekali per group)
+        # Header Tier
         if r['tier'] != current_tier:
             current_tier = r['tier']
             icon = "🏆" if current_tier == "S" else "🥇" if current_tier == "A" else "🥈"
