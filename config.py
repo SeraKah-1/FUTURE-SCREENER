@@ -1,26 +1,25 @@
 import os
 
-# --- KONEKSI TELEGRAM (Diambil dari Secrets GitHub) ---
+# --- TELEGRAM ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# --- SETTING EXCHANGE (ANTI BLOKIR) ---
-# Kita pakai Gate.io (Swap/Futures) karena ramah terhadap IP Server USA
+# --- EXCHANGE ---
 EXCHANGE_ID = 'gate' 
-TOP_VOL_COUNT = 30       # Scan Top 30 Koin Terbesar
-TF_MACRO = '1h'          # Timeframe Besar (Menentukan Trend)
-TF_MICRO = '15m'         # Timeframe Kecil (Menentukan Entry/Trigger)
+TOP_VOL_COUNT = 30       
+TF_MACRO = '1h'          
+TF_MICRO = '15m'         
 
-# --- INDIKATOR TEKNIKAL ---
+# --- INDIKATOR ---
 EMA_FAST = 21
 EMA_MID = 50
 EMA_SLOW = 200
 RSI_PERIOD = 14
 ATR_PERIOD = 14
-ATR_MULTIPLIER = 1.5     # Jarak Stop Loss (1.5x ATR)
+ATR_MULTIPLIER = 1.5     
 
-# --- SISTEM SKORING TIER LIST ---
-# Total poin maksimal = 100
-SCORE_S = 85  # Tier S (Prioritas)
-SCORE_A = 65  # Tier A (Bagus)
-SCORE_B = 50  # Tier B (Spekulatif)
+# --- UPDATE: LONGGARKAN SCORE ---
+# Turunkan threshold biar lebih banyak sinyal masuk saat testing
+SCORE_S = 85
+SCORE_A = 60  # Turun dari 65
+SCORE_B = 30  # Turun drastis dari 50 (biar yg jelek dikit tetap masuk)
