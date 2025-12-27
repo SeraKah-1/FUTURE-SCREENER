@@ -1,146 +1,235 @@
 import ccxt
 import pandas as pd
+import numpy as np
 import requests
 import os
-import numpy as np
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 # --- KONFIGURASI ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# --- PARAMETER ANALISA ---
-LIMIT_CANDLE = 50 
-MIN_VOL_24H = 2_000_000 # Filter likuiditas $2M (Mid-High Cap)
-TIMEFRAME = '1h'
+# Parameter Screening
+TOP_VOL_COUNT = 35       # Scan 35 Koin dengan volume terbesar (Top Liquidity)
+LIMIT_CANDLE = 200       # Minimal candle untuk akurasi EMA 200
+TF_MACRO = '1h'          # Timeframe Trend
+TF_MICRO = '15m'         # Timeframe Trigger (OI & Entry)
 
-print("🔌 Init Data Feed (KuCoin Futures)...")
-exchange = ccxt.kucoinfutures({
+# Exchange Setup (Binance Futures)
+exchange = ccxt.binance({
     'enableRateLimit': True,
     'options': {'defaultType': 'future'}
 })
 
+# --- HELPER FUNCTIONS ---
+
 def send_telegram(message):
-    if not TELEGRAM_TOKEN: return
+    """Mengirim pesan ke Telegram"""
+    if not TELEGRAM_TOKEN:
+        print("⚠️ Telegram Token not found!")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID, 
-        "text": message, 
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
         "parse_mode": "Markdown",
         "disable_web_page_preview": True
     }
-    try: requests.post(url, json=payload)
-    except Exception as e: print(f"Telegram Error: {e}")
-
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
-def get_market_data(symbol):
     try:
-        # Ambil OHLCV
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=LIMIT_CANDLE)
-        df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-        return df
-    except:
-        return None
+        requests.post(url, json=payload)
+    except Exception as e:
+        print(f"❌ Telegram Error: {e}")
 
-def run_screener():
-    print("🔍 Scanning Market for Volatility...")
+def get_top_liquid_pairs():
+    """Mengambil Top 35 Pair berdasarkan Volume USDT"""
+    print("🔍 Scanning Market Liquidity...")
     try:
         tickers = exchange.fetch_tickers()
+        sorted_tickers = sorted(tickers.items(), key=lambda x: x[1].get('quoteVolume', 0), reverse=True)
+        
+        targets = []
+        for symbol, data in sorted_tickers:
+            if '/USDT' in symbol and 'USDC' not in symbol: # Filter Stablecoin pair
+                targets.append(symbol)
+                if len(targets) >= TOP_VOL_COUNT:
+                    break
+        return targets
     except Exception as e:
-        send_telegram(f"❌ API Error: {e}")
+        print(f"❌ Error fetching tickers: {e}")
+        return []
+
+def calculate_indicators(df):
+    """Menghitung EMA, RSI, ATR, Volume SMA"""
+    # EMA
+    df['EMA_21'] = df['close'].ewm(span=21, adjust=False).mean()
+    df['EMA_50'] = df['close'].ewm(span=50, adjust=False).mean()
+    df['EMA_200'] = df['close'].ewm(span=200, adjust=False).mean()
+    
+    # RSI (14)
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    
+    # Volume SMA (20)
+    df['Vol_SMA'] = df['volume'].rolling(window=20).mean()
+    
+    # ATR (14) for Stop Loss
+    high_low = df['high'] - df['low']
+    high_close = np.abs(df['high'] - df['close'].shift())
+    low_close = np.abs(df['low'] - df['close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = np.max(ranges, axis=1)
+    df['ATR'] = true_range.rolling(14).mean()
+    
+    return df
+
+def fetch_and_analyze(symbol):
+    """Core Logic: Fetch Data -> Analisa -> Scoring"""
+    try:
+        # 1. Fetch Data 1H (Macro Trend)
+        ohlcv_1h = exchange.fetch_ohlcv(symbol, TF_MACRO, limit=LIMIT_CANDLE)
+        df_1h = pd.DataFrame(ohlcv_1h, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+        df_1h = calculate_indicators(df_1h)
+        last_1h = df_1h.iloc[-1]
+
+        # 2. Cek Struktur Trend (Saringan Awal)
+        trend_score = 0
+        bias = "NEUTRAL"
+        
+        # Bullish Structure
+        if (last_1h['close'] > last_1h['EMA_21'] > last_1h['EMA_50'] > last_1h['EMA_200']):
+            bias = "BULLISH"
+            trend_score = 40
+        # Bearish Structure
+        elif (last_1h['close'] < last_1h['EMA_21'] < last_1h['EMA_50'] < last_1h['EMA_200']):
+            bias = "BEARISH"
+            trend_score = 40
+            
+        # Jika Sideways/Messy, langsung Skip (Efisiensi)
+        if trend_score == 0:
+            return None
+
+        # 3. Fetch Data 15m (Micro Trigger & OI)
+        # Note: OI History di fetch manual via OHLCV proxy atau fetch khusus jika didukung.
+        # Disini kita pakai logic Volume & Price Action 15m sebagai konfirmasi.
+        ohlcv_15m = exchange.fetch_ohlcv(symbol, TF_MICRO, limit=50)
+        df_15m = pd.DataFrame(ohlcv_15m, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+        df_15m = calculate_indicators(df_15m)
+        last_15m = df_15m.iloc[-1]
+        
+        # Fetch Real OI & Funding (Snapshot)
+        try:
+            ticker_data = exchange.fetch_ticker(symbol)
+            funding_rate = float(ticker_data.get('info', {}).get('lastFundingRate', 0))
+            # Simulasi OI Change (Karena history OI berat di API public)
+            # Kita pakai Volume Spike sebagai proxy Smart Money masuk
+            oi_proxy_score = 0
+            vol_ratio = last_15m['volume'] / last_15m['Vol_SMA']
+            
+            if vol_ratio > 2.5: oi_proxy_score = 30 # Big Volume Spike
+            elif vol_ratio > 1.5: oi_proxy_score = 15
+            
+        except:
+            funding_rate = 0
+            oi_proxy_score = 0
+            vol_ratio = 1.0
+
+        # 4. Momentum Score (RSI)
+        mom_score = 0
+        rsi = last_15m['RSI']
+        
+        if bias == "BULLISH":
+            if 40 < rsi < 70: mom_score = 20 # Healthy Bull
+        elif bias == "BEARISH":
+            if 30 < rsi < 60: mom_score = 20 # Healthy Bear
+            
+        # 5. Total Scoring
+        total_score = trend_score + oi_proxy_score + mom_score
+        
+        # Penentuan Tier
+        tier = "C"
+        if total_score >= 85: tier = "S"
+        elif total_score >= 65: tier = "A"
+        elif total_score >= 50: tier = "B"
+        else: return None # Buang Tier C/Sampah
+        
+        # 6. Risk Management (ATR SL)
+        atr_val = last_15m['ATR']
+        sl_price = 0
+        
+        if bias == "BULLISH":
+            sl_price = last_15m['low'] - (1.5 * atr_val)
+            side = "LONG 🟢"
+        else:
+            sl_price = last_15m['high'] + (1.5 * atr_val)
+            side = "SHORT 🔴"
+
+        return {
+            'symbol': symbol,
+            'side': side,
+            'price': last_15m['close'],
+            'score': total_score,
+            'tier': tier,
+            'sl': sl_price,
+            'vol_x': vol_ratio,
+            'funding': funding_rate * 100
+        }
+
+    except Exception as e:
+        # print(f"Error analyzing {symbol}: {e}")
+        return None
+
+# --- MAIN ENGINE ---
+
+def run_screener():
+    print("🚀 Starting Tier-List Screener...")
+    targets = get_top_liquid_pairs()
+    results = []
+
+    # Parallel Execution biar Cepat
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(fetch_and_analyze, pair) for pair in targets]
+        for future in futures:
+            res = future.result()
+            if res:
+                results.append(res)
+    
+    # Sorting: Tier S -> A -> B, lalu by Score tertinggi
+    tier_order = {'S': 0, 'A': 1, 'B': 2}
+    results.sort(key=lambda x: (tier_order[x['tier']], -x['score']))
+    
+    # Formatting Output Telegram
+    if not results:
+        print("No setups found.")
         return
 
-    targets = []
-    for s, d in tickers.items():
-        if '/USDT:USDT' in s and d.get('quoteVolume', 0) > MIN_VOL_24H:
-            targets.append(s)
-            
-    # Scan 50 koin terlikuid
-    targets_sorted = sorted(targets, key=lambda x: tickers[x]['quoteVolume'], reverse=True)
-    limit_scan = targets_sorted[:50]
+    msg = f"🔥 **MARKET LEADERBOARD (Top {TOP_VOL_COUNT})** 🔥\n"
+    msg += f"⏰ Scan: {pd.Timestamp.now().strftime('%H:%M UTC')}\n\n"
     
-    candidates = []
-
-    for i, symbol in enumerate(limit_scan):
-        clean_name = symbol.split(':')[0]
-        print(f"\rProcessing {i+1}/{len(limit_scan)}: {clean_name}", end="")
-        
-        df = get_market_data(symbol)
-        if df is None or df.empty: continue
-        
-        # --- PERHITUNGAN INDIKATOR (NERDY STUFF) ---
-        # 1. RSI (Momentum)
-        df['RSI'] = calculate_rsi(df['close'])
-        
-        # 2. Moving Averages (Trend)
-        df['EMA_21'] = df['close'].ewm(span=21, adjust=False).mean()
-        df['EMA_50'] = df['close'].ewm(span=50, adjust=False).mean()
-        df['Vol_SMA'] = df['volume'].rolling(window=20).mean()
-        
-        curr = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        # 3. Kuantifikasi Data
-        rsi = curr['RSI']
-        vol_ratio = curr['volume'] / curr['Vol_SMA'] if curr['Vol_SMA'] > 0 else 0
-        price_chg_1h = ((curr['close'] - curr['open']) / curr['open']) * 100
-        
-        # Tentukan Bias Trend
-        if curr['close'] > curr['EMA_21'] and curr['EMA_21'] > curr['EMA_50']:
-            trend = "🟢UP"
-        elif curr['close'] < curr['EMA_21'] and curr['EMA_21'] < curr['EMA_50']:
-            trend = "🔴DOWN"
-        else:
-            trend = "🦀SIDE"
+    current_tier = ""
+    
+    for r in results:
+        # Header Tier (Hanya print sekali per group)
+        if r['tier'] != current_tier:
+            current_tier = r['tier']
+            icon = "🏆" if current_tier == "S" else "🥇" if current_tier == "A" else "🥈"
+            msg += f"\n{icon} **TIER {current_tier} SETUPS**\n"
+            msg += "-"*25 + "\n"
             
-        # --- SCORE SORTING LOGIC ---
-        # Kita ingin koin yang BERGERAK. 
-        # Score = (Volatilitas Harga) + (Ledakan Volume)
-        # Kita pakai Absolute value karena pergerakan turun kencang juga peluang.
-        activity_score = abs(price_chg_1h) * vol_ratio
+        # Isi Setup
+        msg += f"**{r['symbol']}** [{r['side']}]\n"
+        msg += f"   • Score: {r['score']}/100\n"
+        msg += f"   • Vol: {r['vol_x']:.1f}x | Fund: {r['funding']:.4f}%\n"
+        msg += f"   • 🛡️ SL Ref: {r['sl']:.4f}\n\n"
         
-        # Filter Minimal: Hanya masukkan jika ada sedikit aktivitas
-        # Biar list tidak penuh dengan koin mati (0.2x vol)
-        if vol_ratio > 0.8 or abs(price_chg_1h) > 0.5:
-            candidates.append({
-                'ticker': clean_name,
-                'price': curr['close'],
-                'chg': price_chg_1h,
-                'rsi': rsi,
-                'vol_x': vol_ratio,
-                'trend': trend,
-                'score': activity_score
-            })
-
-    # --- REPORTING ---
-    if candidates:
-        # Sortir: Yang paling "Rusuh" (Score tinggi) paling atas
-        candidates.sort(key=lambda x: x['score'], reverse=True)
-        top_5 = candidates[:5]
-        
-        msg = f"📊 *MARKET ANALYTICS (Top Movers)*\n"
-        
-        for s in top_5:
-            # Tanda bahaya/peluang RSI
-            rsi_stat = f"{s['rsi']:.0f}"
-            if s['rsi'] > 70: rsi_stat += "🔥(OB)" # Overbought
-            if s['rsi'] < 30: rsi_stat += "🧊(OS)" # Oversold
-            
-            # Format Output Rapi & Padat
-            msg += (f"\n🔰 *{s['ticker']}* ({s['trend']})"
-                    f"\n  💵 P: {s['price']} ({s['chg']:+.2f}%)"
-                    f"\n  📈 RSI: {rsi_stat} | Vol: {s['vol_x']:.1f}x")
-        
-        send_telegram(msg)
-        print("\n\n✅ Data Analisa Terkirim!")
-    else:
-        print("\n\n💤 Market Hening Total.")
-        send_telegram("💤 Market sedang tidur. Volatilitas sangat rendah.")
+    msg += "💡 *Tier S = Strong Trend + High Vol/Money Inflow*"
+    
+    print(msg) # Debug di console
+    send_telegram(msg)
+    print("✅ Report Sent!")
 
 if __name__ == "__main__":
     run_screener()
