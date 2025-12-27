@@ -14,36 +14,50 @@ def send_telegram(msg):
         "parse_mode": "Markdown",
         "disable_web_page_preview": True
     }
-    requests.post(url, json=payload)
+    try:
+        requests.post(url, json=payload)
+        print("✅ Notifikasi Terkirim ke Telegram.")
+    except Exception as e:
+        print(f"❌ Gagal kirim Telegram: {e}")
 
 def main():
-    print("🚀 Starting GitHub Action Screener...")
+    print("🚀 Starting Screener (Debug Mode)...")
     
     bot = Screener()
-    results = bot.run_scan()
+    # Debug: Print jumlah target
+    targets = bot.get_top_pairs()
+    print(f"📋 Target Scan: {len(targets)} Pairs")
+    
+    results = []
+    # Kita scan loop biasa dulu (tanpa thread) biar kelihatan log errornya satu2
+    print("🕵️‍♂️ Mulai Analisa Detail...")
+    for sym in targets:
+        res = bot.analyze_pair(sym)
+        if res:
+            print(f"✅ FOUND: {sym} -> Score {res['score']}")
+            results.append(res)
+        else:
+            # Ini biar kita tau dia jalan tapi nolak
+            print(f"❌ SKIP: {sym} (Tidak memenuhi kriteria)")
+    
+    # Format Pesan Telegram
+    msg = f"🔥 **LAPORAN SCANNER ({pd.Timestamp.now().strftime('%H:%M UTC')})** 🔥\n"
     
     if not results:
-        print("💤 Tidak ada setup valid.")
-        return
-
-    # Format Pesan
-    msg = f"🔥 **TIER LIST SETUP ({pd.Timestamp.now().strftime('%H:%M UTC')})** 🔥\n"
-    msg += "Exchange: Gate.io (US IP Safe)\n"
+        msg += "\n💤 **Market Sedang Tidur / Sideways**\n"
+        msg += "Tidak ada setup Tier A/B yang valid saat ini.\n"
+        msg += f"(Scanned {len(targets)} pairs on Gate.io)"
+        print("⚠️ Tidak ada setup, tapi tetap kirim laporan...")
+    else:
+        results.sort(key=lambda x: -x['score'])
+        for r in results:
+            msg += f"\n**{r['symbol']}** [{r['side']}]\n"
+            msg += f"📊 Score: {r['score']} (Tier {r['tier']})\n"
+            msg += f"💰 Price: {r['price']}\n"
     
-    current_tier = ""
-    for r in results:
-        if r['tier'] != current_tier:
-            current_tier = r['tier']
-            icon = "🏆" if current_tier == "S" else "🥇" if current_tier == "A" else "🥈"
-            msg += f"\n{icon} **TIER {current_tier}**\n" + "-"*15 + "\n"
-        
-        msg += f"**{r['symbol']}** {r['side']} ({r['score']})\n"
-        msg += f"Price: {r['price']} | Vol: {r['vol']:.1f}x\n"
-        msg += f"🛡️ SL: {r['sl']:.4f}\n"
-
-    print(msg)
+    # KIRIM LAPORAN (Mau ada hasil atau tidak)
     send_telegram(msg)
-    print("✅ Done.")
+    print("🏁 Selesai.")
 
 if __name__ == "__main__":
     main()
