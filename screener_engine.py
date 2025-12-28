@@ -21,10 +21,9 @@ class Screener:
                 if 'USDT' in s and d.get('quoteVolume'):
                     targets.append((s, d['quoteVolume']))
             
-            # Ambil Top 30
+            # Ambil pair dengan volume terbesar agar tidak terjebak koin gorengan
             targets = sorted(targets, key=lambda x: x[1], reverse=True)[:config.TOP_VOL_COUNT]
-            final_pairs = [t[0] for t in targets]
-            return final_pairs
+            return [t[0] for t in targets]
         except Exception as e:
             print(f"❌ Error fetching tickers: {e}")
             return []
@@ -32,124 +31,105 @@ class Screener:
     def calculate_indicators(self, df):
         if df is None or df.empty: return None
         
-        # Kita hanya butuh EMA 50 sebagai Baseline Trend Utama
+        # EMA Ribbon (Indikator utama trend 1H/4H)
+        df['EMA_21'] = df['close'].ewm(span=config.EMA_FAST).mean()
         df['EMA_50'] = df['close'].ewm(span=config.EMA_MID).mean()
+        df['EMA_200'] = df['close'].ewm(span=config.EMA_SLOW).mean()
         
-        # RSI
+        # RSI (Momentum)
         delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(config.RSI_PERIOD).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(config.RSI_PERIOD).mean()
+        gain = (delta.where(delta > 0, 0)).ewm(alpha=1/config.RSI_PERIOD, adjust=False).mean()
+        loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/config.RSI_PERIOD, adjust=False).mean()
         rs = gain / loss
         df['RSI'] = 100 - (100 / (1 + rs))
         
-        # Volume SMA & ATR
+        # Volume Average
         df['Vol_SMA'] = df['volume'].rolling(20).mean()
-        high_low = df['high'] - df['low']
-        h_c = np.abs(df['high'] - df['close'].shift())
-        l_c = np.abs(df['low'] - df['close'].shift())
-        tr = np.max(pd.concat([high_low, h_c, l_c], axis=1), axis=1)
-        df['ATR'] = tr.rolling(config.ATR_PERIOD).mean()
         
         return df
 
     def analyze_pair(self, symbol):
         try:
-            # --- 1. MACRO (1H) - TENTUKAN ARAH (BIAS) ---
-            ohlcv_1h = self.exchange.fetch_ohlcv(symbol, config.TF_MACRO, limit=100)
-            df_macro = self.calculate_indicators(pd.DataFrame(ohlcv_1h, columns=['t','o','h','l','c','v']))
-            last_macro = df_macro.iloc[-1]
+            # Ambil data candle 1H (atau 4H sesuai config)
+            ohlcv = self.exchange.fetch_ohlcv(symbol, config.TF_TRADE, limit=250)
+            if not ohlcv: return None
             
+            df = self.calculate_indicators(pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v']))
+            curr = df.iloc[-1] # Candle terakhir
+            prev = df.iloc[-2] # Candle sebelumnya (untuk konfirmasi)
+            
+            # --- 1. TENTUKAN ARAH MAJOR (BIAS) ---
+            # Di TF 1H/4H, harga WAJIB di atas/bawah EMA 200 untuk trend yang sehat
             bias = "NEUTRAL"
-            trend_score = 0
+            if curr['close'] > curr['EMA_200']: bias = "LONG"
+            elif curr['close'] < curr['EMA_200']: bias = "SHORT"
             
-            # LOGIKA BARU (AGRESIF):
-            # Cukup lihat posisi harga terhadap EMA 50
-            if last_macro['c'] > last_macro['EMA_50']:
-                bias = "BULLISH"
-                trend_score = 20 # Skor dasar
-            else:
-                bias = "BEARISH"
-                trend_score = 20 # Skor dasar
-            
-            # --- 2. MICRO (15m) - TENTUKAN ENTRY ---
-            ohlcv_15m = self.exchange.fetch_ohlcv(symbol, config.TF_MICRO, limit=50)
-            df_micro = self.calculate_indicators(pd.DataFrame(ohlcv_15m, columns=['t','o','h','l','c','v']))
-            last_micro = df_micro.iloc[-1]
-            
-            # A. Volume Score (Cari aktivitas)
-            vol_score = 0
-            # Jika Volume SMA nol (data error), anggap 1
-            avg_vol = last_micro['Vol_SMA'] if last_micro['Vol_SMA'] > 0 else last_micro['v']
-            vol_ratio = last_micro['v'] / avg_vol
-            
-            if vol_ratio > 2.0: vol_score = 40      # Ledakan Volume
-            elif vol_ratio > 1.2: vol_score = 20    # Volume Lumayan
-            
-            # B. RSI Score (Momentum)
-            mom_score = 0
-            rsi = last_micro['RSI']
-            
-            if bias == "BULLISH":
-                # Cari RSI yang menanjak tapi belum Overbought parah (>75)
-                if 40 <= rsi <= 75: mom_score = 20
-            elif bias == "BEARISH":
-                # Cari RSI yang turun tapi belum Oversold parah (<25)
-                # KITA LONGGARKAN DISINI: Izinkan short meski RSI 30an (kuat turun)
-                if 25 <= rsi <= 60: mom_score = 20
-            
-            # TOTAL SKOR
-            total_score = trend_score + vol_score + mom_score
-            
-            # --- TIERING ---
-            tier = "C"
-            # Skor minimal diturunkan biar banyak sinyal masuk
-            if total_score >= 70: tier = "S"
-            elif total_score >= 50: tier = "A" 
-            elif total_score >= 30: tier = "B" # Asal ada volume dikit, masuk B
-            else: return None
-            
-            # --- RISK CALC (SL) ---
-            sl_price = 0
-            side = ""
-            atr_val = last_micro['ATR']
-            
-            if bias == "BULLISH":
-                sl_price = last_micro['l'] - (config.ATR_MULTIPLIER * atr_val)
-                side = "LONG 🟢"
-            else:
-                sl_price = last_micro['h'] + (config.ATR_MULTIPLIER * atr_val)
-                side = "SHORT 🔴"
+            if bias == "NEUTRAL": return None 
 
-            # Funding (Optional)
-            funding = 0
-            try: 
-                tk = self.exchange.fetch_ticker(symbol)
-                funding = tk.get('info', {}).get('funding_rate', 0)
-            except: pass
+            # --- 2. HITUNG SKOR KUALITAS (0 - 100) ---
+            score = 0
+            
+            # A. TREND STRUCTURE (Max 40 Poin)
+            # Perfect Alignment: EMA 21 > EMA 50 > EMA 200 (Bullish)
+            if bias == "LONG":
+                if curr['EMA_21'] > curr['EMA_50'] > curr['EMA_200']:
+                    score += 40 # Struktur Trend Sempurna
+                elif curr['close'] > curr['EMA_50']:
+                    score += 20 # Trend Oke
+            else: # SHORT
+                if curr['EMA_21'] < curr['EMA_50'] < curr['EMA_200']:
+                    score += 40
+                elif curr['close'] < curr['EMA_50']:
+                    score += 20
+
+            # B. MOMENTUM RSI (Max 30 Poin)
+            # Kita cari yang sedang kuat tapi belum "terbang ketinggian"
+            rsi = curr['RSI']
+            if bias == "LONG":
+                if 50 <= rsi <= 70: score += 30      # Zona Bullish Ideal (Kuat naik)
+                elif 40 <= rsi < 50: score += 15     # Zona Rebound
+                elif rsi > 75: score -= 10           # Terlalu tinggi (Overbought), bahaya
+            else: # SHORT
+                if 30 <= rsi <= 50: score += 30      # Zona Bearish Ideal (Kuat turun)
+                elif 50 < rsi <= 60: score += 15     # Zona Rejection
+                elif rsi < 25: score -= 10           # Terlalu rendah (Oversold), bahaya
+
+            # C. VOLUME POWER (Max 30 Poin)
+            # Validasi trend dengan volume
+            vol_ratio = curr['volume'] / curr['Vol_SMA']
+            if vol_ratio > 1.5: score += 30          # Volume Spike (Ada Big Player)
+            elif vol_ratio > 1.0: score += 15        # Volume di atas rata-rata
+            else: score += 5                         # Volume biasa
+
+            # --- FILTER AKHIR ---
+            if score < config.MIN_SCORE: return None
+            
+            # Hitung persentase perubahan harga candle terakhir
+            price_change_pct = ((curr['close'] - curr['open']) / curr['open']) * 100
 
             return {
                 'symbol': symbol.replace('_', '/'),
-                'side': side, 
-                'score': total_score, 
-                'tier': tier,
-                'price': last_micro['c'], 
-                'sl': sl_price, 
-                'vol': vol_ratio, 
-                'fund': float(funding)*100
+                'side': "LONG 🟢" if bias == "LONG" else "SHORT 🔴",
+                'score': score,
+                'price': curr['close'],
+                'change_1h': round(price_change_pct, 2),
+                'vol_stat': round(vol_ratio, 1)
             }
-        except Exception as e: 
+
+        except Exception as e:
             return None
 
     def run_scan(self):
         targets = self.get_top_pairs()
         if not targets: return []
         
+        print(f"🕵️‍♂️ Scanning {len(targets)} Pairs ({config.TF_TRADE})...")
         results = []
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        with ThreadPoolExecutor(max_workers=10) as executor:
             futures = [executor.submit(self.analyze_pair, s) for s in targets]
             for f in futures:
-                if f.result(): results.append(f.result())
+                res = f.result()
+                if res: results.append(res)
                 
-        tier_map = {'S':0, 'A':1, 'B':2}
-        results.sort(key=lambda x: (tier_map[x['tier']], -x['score']))
+        results.sort(key=lambda x: -x['score'])
         return results
