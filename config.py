@@ -18,4 +18,4 @@ RSI_PERIOD = 14
 # --- FILTER SELEKTIF ---
 # Skor minimal agar sinyal dikirim (0-100)
 # Kita set tinggi (75) biar yang muncul benar-benar yang chart-nya bagus
-MIN_SCORE = 75
+MIN_SCORE = 50
