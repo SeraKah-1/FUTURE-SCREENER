@@ -1,10 +1,12 @@
-name: Network Debugger
+name: Crypto Bot
 
 on:
-  workflow_dispatch: # Hanya jalan kalau dipencet manual
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
 
 jobs:
-  debug:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -13,6 +15,9 @@ jobs:
         with:
           python-version: '3.10'
       - name: Install Libraries
-        run: pip install ccxt requests
-      - name: Run Network Test
-        run: python debug_network.py
+        run: pip install -r requirements.txt
+      - name: Run Screener
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python main.py
