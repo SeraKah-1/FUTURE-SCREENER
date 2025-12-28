@@ -17,126 +17,148 @@ class Screener:
             tickers = self.exchange.fetch_tickers()
             targets = []
             for s, d in tickers.items():
-                # Filter Gate.io Swap (USDT)
                 if 'USDT' in s and d.get('quoteVolume') and float(d['quoteVolume']) > 0:
                     targets.append((s, d['quoteVolume']))
-            
-            # Sort Volume Terbesar
             targets = sorted(targets, key=lambda x: x[1], reverse=True)[:config.TOP_VOL_COUNT]
             return [t[0] for t in targets]
-        except Exception as e:
-            print(f"❌ Error tickers: {e}")
+        except Exception:
             return []
 
+    # --- RUMUS INDIKATOR KOMPLEKS ---
     def calculate_indicators(self, df):
         if df is None or df.empty: return None
         
-        # EMA 50 (Trend Utama)
-        df['EMA_50'] = df['close'].ewm(span=config.EMA_MID).mean()
+        # 1. VOLUME 21 EMA (Daily context)
+        df['Vol_Mean_21'] = df['volume'].rolling(21).mean()
         
-        # RSI
+        # 2. RSI 21
         delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(config.RSI_PERIOD).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(config.RSI_PERIOD).mean()
+        gain = (delta.where(delta > 0, 0)).rolling(21).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(21).mean()
         rs = gain / loss
-        df['RSI'] = 100 - (100 / (1 + rs))
+        df['RSI_21'] = 100 - (100 / (1 + rs))
         
-        # Volume & ATR
-        df['Vol_SMA'] = df['volume'].rolling(20).mean()
+        # 3. ATR 14
         high_low = df['high'] - df['low']
         h_c = np.abs(df['high'] - df['close'].shift())
         l_c = np.abs(df['low'] - df['close'].shift())
         tr = np.max(pd.concat([high_low, h_c, l_c], axis=1), axis=1)
         df['ATR'] = tr.rolling(14).mean()
         
+        # 4. CMF 21 (Chaikin Money Flow) - Whale Detector
+        # MFV = [(Close - Low) - (High - Close)] / (High - Low) * Vol
+        mfv = ((df['close'] - df['low']) - (df['high'] - df['close'])) / (df['high'] - df['low']) * df['volume']
+        df['CMF_21'] = mfv.rolling(21).sum() / df['volume'].rolling(21).sum()
+        
+        # 5. DMI 14 (ADX, +DI, -DI) - Trend Strength
+        up = df['high'].diff()
+        down = -df['low'].diff()
+        
+        plus_dm = np.where((up > down) & (up > 0), up, 0)
+        minus_dm = np.where((down > up) & (down > 0), down, 0)
+        
+        # Smoothing (Mirip Wilder's)
+        tr_smooth = tr.rolling(14).mean()
+        plus_di = 100 * (pd.Series(plus_dm).rolling(14).mean() / tr_smooth)
+        minus_di = 100 * (pd.Series(minus_dm).rolling(14).mean() / tr_smooth)
+        
+        dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di)
+        adx = dx.rolling(14).mean()
+        
+        df['ADX'] = adx
+        df['DI_Plus'] = plus_di
+        df['DI_Minus'] = minus_di
+        
         return df
 
     def analyze_pair(self, symbol):
         try:
-            # --- 1. MACRO (1H) - TENTUKAN ARAH ---
-            ohlcv_1h = self.exchange.fetch_ohlcv(symbol, config.TF_MACRO, limit=100)
-            df_macro = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df_macro = self.calculate_indicators(df_macro)
-            last_macro = df_macro.iloc[-1]
+            # --- 1. MACRO (DAILY) - VALIDASI INDIKATOR BERAT ---
+            # Kita ambil data Daily untuk CMF, DMI, dan Vol 21
+            ohlcv_d = self.exchange.fetch_ohlcv(symbol, '1d', limit=100)
+            df_d = pd.DataFrame(ohlcv_d, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df_d = self.calculate_indicators(df_d)
+            last_d = df_d.iloc[-2] # Ambil candle Daily kemarin (Close) agar valid
             
-            # LOGIKA BARU: Cukup harga di atas/bawah EMA 50
-            # Ini menjamin bot tidak "Bisu" (Pasti ada bias Long atau Short)
-            if last_macro['close'] > last_macro['EMA_50']:
-                bias = "BULLISH"
+            bias = "NEUTRAL"
+            score = 0
+            
+            # --- LOGIKA DMI (Trend Master) ---
+            # ADX > 20 artinya Trend mulai jalan. Di bawah 20 = Sideways parah.
+            if last_d['ADX'] > 20:
+                if last_d['DI_Plus'] > last_d['DI_Minus']:
+                    bias = "BULLISH"
+                    score += 30
+                elif last_d['DI_Minus'] > last_d['DI_Plus']:
+                    bias = "BEARISH"
+                    score += 30
             else:
-                bias = "BEARISH"
+                return None # Market Mati / Sideways, langsung Skip.
 
-            # --- 2. MICRO (15m) - ENTRY POINT ---
+            # --- LOGIKA CMF (Money Flow) ---
+            # CMF Positif = Uang Masuk (Akumulasi)
+            # CMF Negatif = Uang Keluar (Distribusi)
+            if bias == "BULLISH" and last_d['CMF_21'] > 0:
+                score += 20
+            elif bias == "BEARISH" and last_d['CMF_21'] < 0:
+                score += 20
+            else:
+                score -= 10 # Arah trend dan arus uang tidak sinkron (Bahaya)
+
+            # --- LOGIKA RSI 21 ---
+            # RSI 21 lebih smooth.
+            rsi = last_d['RSI_21']
+            if bias == "BULLISH" and rsi > 50: score += 10
+            elif bias == "BEARISH" and rsi < 50: score += 10
+
+            # --- LOGIKA VOLUME ---
+            # Apakah Volume kemarin > Rata-rata 21 hari?
+            if last_d['volume'] > last_d['Vol_Mean_21']:
+                score += 10 # Validasi Breakout
+            
+            # --- 2. MICRO (15m) - ENTRY TRIGGER ---
+            # Kita hanya entry jika 15m searah dengan Daily
             ohlcv_15m = self.exchange.fetch_ohlcv(symbol, config.TF_MICRO, limit=50)
-            df_micro = pd.DataFrame(ohlcv_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df_micro = self.calculate_indicators(df_micro)
-            last_micro = df_micro.iloc[-1]
+            df_m = pd.DataFrame(ohlcv_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df_m = self.calculate_indicators(df_m) # Hitung ATR buat SL
             
-            # --- SCORING SYSTEM (Base 40) ---
-            score = 40
+            current_price = df_m.iloc[-1]['close']
+            atr_micro = df_m.iloc[-2]['ATR']
             
-            # A. Volume (Max +30)
-            avg_vol = last_micro['Vol_SMA'] if last_micro['Vol_SMA'] > 0 else last_micro['volume']
-            vol_ratio = last_micro['volume'] / avg_vol
-            
-            if vol_ratio > 2.5: score += 30      # Volume Ledakan
-            elif vol_ratio > 1.2: score += 15    # Volume Sehat
-            
-            # B. RSI Momentum (Max +30)
-            rsi = last_micro['RSI']
-            if bias == "BULLISH":
-                if 45 <= rsi <= 65: score += 30    # Golden Zone Long
-                elif 40 <= rsi <= 75: score += 15  # OK Zone
-            else: # Bearish
-                if 35 <= rsi <= 55: score += 30    # Golden Zone Short
-                elif 25 <= rsi <= 60: score += 15  # OK Zone
-                
-            # C. Bonus Trend Alignment (+10)
-            # Jika 15m juga sepakat dengan 1H (Contoh: 1H Bullish DAN 15m > EMA50)
-            micro_trend = "BULLISH" if last_micro['close'] > last_micro['EMA_50'] else "BEARISH"
-            if bias == micro_trend:
-                score += 10
-
-            # --- FILTER AKHIR ---
+            # FILTER AKHIR
             if score < config.MIN_SCORE: return None
             
-            # --- STOP LOSS ---
-            atr = last_micro['ATR']
+            # Stop Loss Calc
             if bias == "BULLISH":
-                sl = last_micro['low'] - (config.ATR_MULTIPLIER * atr)
+                sl = current_price - (config.ATR_MULTIPLIER * atr_micro)
                 side = "LONG 🟢"
             else:
-                sl = last_micro['high'] + (config.ATR_MULTIPLIER * atr)
+                sl = current_price + (config.ATR_MULTIPLIER * atr_micro)
                 side = "SHORT 🔴"
 
-            # Clean Symbol (Gate suka kasih format BTC_USDT, kita ubah jadi BTC/USDT)
             clean_symbol = symbol.replace('_', '/') 
             
             return {
                 'symbol': clean_symbol,
                 'side': side,
                 'score': score,
-                'price': last_micro['close'],
+                'price': current_price,
                 'sl': sl,
-                'vol': vol_ratio
+                'vol': last_d['volume'] / last_d['Vol_Mean_21'], # Ratio Volume Daily
+                'adx': last_d['ADX'],
+                'cmf': last_d['CMF_21']
             }
         except Exception as e:
-            # print(f"Err {symbol}: {e}")
             return None
 
     def run_scan(self):
         targets = self.get_top_pairs()
-        if not targets: 
-            print("❌ Gagal mengambil daftar koin.")
-            return []
-            
-        print(f"🔍 Menganalisa {len(targets)} pair secara detail...")
+        print(f"🔍 Scanning {len(targets)} Pairs with ADVANCED Indicators (DMI, CMF, RSI21)...")
         results = []
         with ThreadPoolExecutor(max_workers=5) as executor:
             futures = [executor.submit(self.analyze_pair, s) for s in targets]
             for f in futures:
                 if f.result(): results.append(f.result())
         
-        # Urutkan: Score tertinggi paling atas
         results.sort(key=lambda x: -x['score'])
         return results
