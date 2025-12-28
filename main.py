@@ -4,9 +4,7 @@ import config
 from screener_engine import Screener
 
 def send_telegram(msg):
-    if not config.TELEGRAM_TOKEN:
-        print("⚠️ Token Telegram Kosong!")
-        return
+    if not config.TELEGRAM_TOKEN: return
     url = f"https://api.telegram.org/bot{config.TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": config.TELEGRAM_CHAT_ID,
@@ -14,50 +12,37 @@ def send_telegram(msg):
         "parse_mode": "Markdown",
         "disable_web_page_preview": True
     }
-    try:
-        requests.post(url, json=payload)
-        print("✅ Notifikasi Terkirim ke Telegram.")
-    except Exception as e:
-        print(f"❌ Gagal kirim Telegram: {e}")
+    try: requests.post(url, json=payload)
+    except: pass
 
 def main():
-    print("🚀 Starting Screener (Debug Mode)...")
-    
+    print("🚀 Starting 1H/4H Trend Screener...")
     bot = Screener()
-    # Debug: Print jumlah target
-    targets = bot.get_top_pairs()
-    print(f"📋 Target Scan: {len(targets)} Pairs")
+    results = bot.run_scan()
     
-    results = []
-    # Kita scan loop biasa dulu (tanpa thread) biar kelihatan log errornya satu2
-    print("🕵️‍♂️ Mulai Analisa Detail...")
-    for sym in targets:
-        res = bot.analyze_pair(sym)
-        if res:
-            print(f"✅ FOUND: {sym} -> Score {res['score']}")
-            results.append(res)
-        else:
-            # Ini biar kita tau dia jalan tapi nolak
-            print(f"❌ SKIP: {sym} (Tidak memenuhi kriteria)")
-    
-    # Format Pesan Telegram
-    msg = f"🔥 **LAPORAN SCANNER ({pd.Timestamp.now().strftime('%H:%M UTC')})** 🔥\n"
+    # Header Pesan
+    msg = f"📡 **SIGNAL RADAR ({config.TF_TRADE.upper()})**\n"
+    msg += f"🕒 {pd.Timestamp.now().strftime('%H:%M UTC')}\n"
+    msg += "➖➖➖➖➖➖➖➖➖➖\n"
     
     if not results:
-        msg += "\n💤 **Market Sedang Tidur / Sideways**\n"
-        msg += "Tidak ada setup Tier A/B yang valid saat ini.\n"
-        msg += f"(Scanned {len(targets)} pairs on Gate.io)"
-        print("⚠️ Tidak ada setup, tapi tetap kirim laporan...")
+        msg += "💤 **No High Probability Setups**\n"
+        msg += "Market is sideways or messy.\n"
+        print("⚠️ No results found.")
     else:
-        results.sort(key=lambda x: -x['score'])
-        for r in results:
-            msg += f"\n**{r['symbol']}** [{r['side']}]\n"
-            msg += f"📊 Score: {r['score']} (Tier {r['tier']})\n"
-            msg += f"💰 Price: {r['price']}\n"
+        # Batasi cuma kirim Top 5 biar gak spam
+        top_results = results[:5] 
+        for r in top_results:
+            icon = "🔥" if r['score'] >= 90 else "⚡"
+            msg += f"{icon} **{r['symbol']}** [{r['side']}]\n"
+            msg += f"🏆 Score: **{r['score']}/100**\n"
+            msg += f"💰 Price: `{r['price']}`\n"
+            msg += f"📊 Candle Chg: {r['change_1h']}%\n"
+            msg += f"🌊 Vol Ratio: {r['vol_stat']}x\n"
+            msg += "➖➖➖➖➖➖➖➖➖➖\n"
     
-    # KIRIM LAPORAN (Mau ada hasil atau tidak)
     send_telegram(msg)
-    print("🏁 Selesai.")
+    print("✅ Done.")
 
 if __name__ == "__main__":
     main()
