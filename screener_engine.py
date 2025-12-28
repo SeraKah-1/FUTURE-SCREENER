@@ -50,61 +50,73 @@ class Screener:
 
     def analyze_pair(self, symbol):
         try:
-            # Ambil data candle 1H (atau 4H sesuai config)
-            ohlcv = self.exchange.fetch_ohlcv(symbol, config.TF_TRADE, limit=250)
+            # Ambil data candle
+            ohlcv = self.exchange.fetch_ohlcv(symbol, config.TF_TRADE, limit=300)
             if not ohlcv: return None
             
             df = self.calculate_indicators(pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v']))
-            curr = df.iloc[-1] # Candle terakhir
-            prev = df.iloc[-2] # Candle sebelumnya (untuk konfirmasi)
+            curr = df.iloc[-1]
             
-            # --- 1. TENTUKAN ARAH MAJOR (BIAS) ---
-            # Di TF 1H/4H, harga WAJIB di atas/bawah EMA 200 untuk trend yang sehat
+            # --- 1. TENTUKAN BIAS ---
             bias = "NEUTRAL"
             if curr['close'] > curr['EMA_200']: bias = "LONG"
             elif curr['close'] < curr['EMA_200']: bias = "SHORT"
             
-            if bias == "NEUTRAL": return None 
+            # DEBUG: Kalo Neutral langsung skip
+            if bias == "NEUTRAL": 
+                # print(f"❌ {symbol} SKIP: Sideways di EMA 200")
+                return None 
 
-            # --- 2. HITUNG SKOR KUALITAS (0 - 100) ---
+            # --- 2. HITUNG SKOR ---
             score = 0
+            reasons = [] # Nampung alasan poin plus
             
-            # A. TREND STRUCTURE (Max 40 Poin)
-            # Perfect Alignment: EMA 21 > EMA 50 > EMA 200 (Bullish)
+            # A. TREND STRUCTURE (Max 40)
             if bias == "LONG":
                 if curr['EMA_21'] > curr['EMA_50'] > curr['EMA_200']:
-                    score += 40 # Struktur Trend Sempurna
+                    score += 40
+                    reasons.append("Perfect Bull")
                 elif curr['close'] > curr['EMA_50']:
-                    score += 20 # Trend Oke
+                    score += 20
+                    reasons.append("Bull Trend")
             else: # SHORT
                 if curr['EMA_21'] < curr['EMA_50'] < curr['EMA_200']:
                     score += 40
+                    reasons.append("Perfect Bear")
                 elif curr['close'] < curr['EMA_50']:
                     score += 20
+                    reasons.append("Bear Trend")
 
-            # B. MOMENTUM RSI (Max 30 Poin)
-            # Kita cari yang sedang kuat tapi belum "terbang ketinggian"
+            # B. MOMENTUM RSI (Max 30)
             rsi = curr['RSI']
             if bias == "LONG":
-                if 50 <= rsi <= 70: score += 30      # Zona Bullish Ideal (Kuat naik)
-                elif 40 <= rsi < 50: score += 15     # Zona Rebound
-                elif rsi > 75: score -= 10           # Terlalu tinggi (Overbought), bahaya
+                if 50 <= rsi <= 70: 
+                    score += 30
+                    reasons.append("RSI Power")
+                elif 40 <= rsi < 50: score += 15
             else: # SHORT
-                if 30 <= rsi <= 50: score += 30      # Zona Bearish Ideal (Kuat turun)
-                elif 50 < rsi <= 60: score += 15     # Zona Rejection
-                elif rsi < 25: score -= 10           # Terlalu rendah (Oversold), bahaya
+                if 30 <= rsi <= 50: 
+                    score += 30
+                    reasons.append("RSI Power")
+                elif 50 < rsi <= 60: score += 15
 
-            # C. VOLUME POWER (Max 30 Poin)
-            # Validasi trend dengan volume
+            # C. VOLUME (Max 30)
             vol_ratio = curr['volume'] / curr['Vol_SMA']
-            if vol_ratio > 1.5: score += 30          # Volume Spike (Ada Big Player)
-            elif vol_ratio > 1.0: score += 15        # Volume di atas rata-rata
-            else: score += 5                         # Volume biasa
+            if vol_ratio > 1.5: 
+                score += 30
+                reasons.append("Big Vol")
+            elif vol_ratio > 1.0: 
+                score += 15
+            else:
+                score += 5 # Volume sepi dikasih poin kecil
 
             # --- FILTER AKHIR ---
-            if score < config.MIN_SCORE: return None
+            # DEBUG PRINT: Biar tau skor koin yang ditolak berapa
+            if score < config.MIN_SCORE: 
+                print(f"⚠️ {symbol} Score: {score} (Kurang dari {config.MIN_SCORE}) -> Ditolak")
+                return None
             
-            # Hitung persentase perubahan harga candle terakhir
+            # Kalau lolos filter:
             price_change_pct = ((curr['close'] - curr['open']) / curr['open']) * 100
 
             return {
@@ -113,10 +125,12 @@ class Screener:
                 'score': score,
                 'price': curr['close'],
                 'change_1h': round(price_change_pct, 2),
-                'vol_stat': round(vol_ratio, 1)
+                'vol_stat': round(vol_ratio, 1),
+                'note': ", ".join(reasons)
             }
 
         except Exception as e:
+            print(f"Error {symbol}: {e}")
             return None
 
     def run_scan(self):
