@@ -1,27 +1,18 @@
-name: Crypto Screener Bot
+name: Network Debugger
 
 on:
-  schedule:
-    - cron: '*/15 * * * *' # Jalan otomatis setiap 15 menit
-  workflow_dispatch: # Tombol Manual Run
+  workflow_dispatch: # Hanya jalan kalau dipencet manual
 
 jobs:
-  build:
+  debug:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
-      
       - name: Install Libraries
-        run: pip install -r requirements.txt
-      
-      - name: Run Screener
-        env:
-          # Pastikan Anda sudah set Secrets ini di Settings Repo
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python main.py
+        run: pip install ccxt requests
+      - name: Run Network Test
+        run: python debug_network.py
