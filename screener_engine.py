@@ -27,36 +27,50 @@ class Screener:
     def calculate_indicators(self, df):
         if df is None or df.empty: return None
         
-        # 1. VOLUME 21 EMA
+        # --- 1. GENERAL INDICATORS ---
+        # EMA 50 (Untuk Micro Trend 15m)
+        df['EMA_50'] = df['close'].ewm(span=50).mean()
+        
+        # Volume Mean 21 (Untuk Daily Breakout)
         df['Vol_Mean_21'] = df['volume'].rolling(21).mean()
         
-        # 2. RSI 21
+        # RSI 21 (Smooth RSI)
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(21).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(21).mean()
         rs = gain / loss
         df['RSI_21'] = 100 - (100 / (1 + rs))
         
-        # 3. ATR 14
+        # ATR 14 (Untuk Stop Loss)
         high_low = df['high'] - df['low']
         h_c = np.abs(df['high'] - df['close'].shift())
         l_c = np.abs(df['low'] - df['close'].shift())
         tr = np.max(pd.concat([high_low, h_c, l_c], axis=1), axis=1)
         df['ATR'] = tr.rolling(14).mean()
         
-        # 4. CMF 21
+        # --- 2. ADVANCED INDICATORS (Daily) ---
+        # CMF 21 (Chaikin Money Flow)
         mfv = ((df['close'] - df['low']) - (df['high'] - df['close'])) / (df['high'] - df['low']) * df['volume']
-        df['CMF_21'] = mfv.rolling(21).sum() / df['volume'].rolling(21).sum()
+        # Handle division by zero
+        vol_sum = df['volume'].rolling(21).sum()
+        df['CMF_21'] = np.where(vol_sum == 0, 0, mfv.rolling(21).sum() / vol_sum)
         
-        # 5. DMI 14 (ADX)
+        # DMI 14 (ADX, +DI, -DI)
         up = df['high'].diff()
         down = -df['low'].diff()
         plus_dm = np.where((up > down) & (up > 0), up, 0)
         minus_dm = np.where((down > up) & (down > 0), down, 0)
+        
         tr_smooth = tr.rolling(14).mean()
-        plus_di = 100 * (pd.Series(plus_dm).rolling(14).mean() / tr_smooth)
-        minus_di = 100 * (pd.Series(minus_dm).rolling(14).mean() / tr_smooth)
-        dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di)
+        # Hindari pembagian dengan 0
+        tr_smooth = tr_smooth.replace(0, np.nan) 
+        
+        # Perbaikan: Pastikan index selaras saat membuat Series
+        plus_di = 100 * (pd.Series(plus_dm, index=df.index).rolling(14).mean() / tr_smooth)
+        minus_di = 100 * (pd.Series(minus_dm, index=df.index).rolling(14).mean() / tr_smooth)
+        
+        sum_di = plus_di + minus_di
+        dx = 100 * np.abs(plus_di - minus_di) / sum_di.replace(0, np.nan)
         df['ADX'] = dx.rolling(14).mean()
         df['DI_Plus'] = plus_di
         df['DI_Minus'] = minus_di
@@ -65,18 +79,19 @@ class Screener:
 
     def analyze_pair(self, symbol):
         try:
-            # --- 1. MACRO (DAILY) ---
+            # =========================================
+            # TAHAP 1: MACRO ANALYSIS (DAILY)
+            # =========================================
             ohlcv_d = self.exchange.fetch_ohlcv(symbol, '1d', limit=100)
             df_d = pd.DataFrame(ohlcv_d, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df_d = self.calculate_indicators(df_d)
+            last_d = df_d.iloc[-2] # Daily Close Kemarin
             
-            last_d = df_d.iloc[-2] # Candle Daily Kemarin (Close)
-            
-            # --- LOGIKA SWING ---
             bias = "NEUTRAL"
             score = 0
             
-            # ADX Filter
+            # 1. DMI TREND FILTER (Syarat Utama)
+            # ADX > 20 artinya trend mulai terbentuk
             if last_d['ADX'] > 20:
                 if last_d['DI_Plus'] > last_d['DI_Minus']:
                     bias = "BULLISH"
@@ -85,53 +100,75 @@ class Screener:
                     bias = "BEARISH"
                     score += 30
             else:
-                return None 
+                return None # Market Sideways / Tidak Jelas -> SKIP
+            
+            # 2. CMF MONEY FLOW (Konfirmasi Bandar)
+            if bias == "BULLISH" and last_d['CMF_21'] > 0: score += 15
+            elif bias == "BEARISH" and last_d['CMF_21'] < 0: score += 15
+            else: score -= 10 # Divergence (Harga naik tapi uang keluar)
 
-            # CMF Filter
-            if bias == "BULLISH" and last_d['CMF_21'] > 0: score += 20
-            elif bias == "BEARISH" and last_d['CMF_21'] < 0: score += 20
-            else: score -= 10
-
-            # RSI Filter
+            # 3. RSI 21 (Momentum Jangka Menengah)
             if bias == "BULLISH" and last_d['RSI_21'] > 50: score += 10
             elif bias == "BEARISH" and last_d['RSI_21'] < 50: score += 10
 
-            # Volume Breakout Filter
+            # 4. DAILY VOLUME BREAKOUT
             if last_d['volume'] > last_d['Vol_Mean_21']: score += 10
             
-            # --- 2. MICRO (15m) & DATA REALTIME ---
-            ohlcv_15m = self.exchange.fetch_ohlcv(symbol, config.TF_MICRO, limit=50)
+            # =========================================
+            # TAHAP 2: MICRO ANALYSIS (15m)
+            # =========================================
+            ohlcv_15m = self.exchange.fetch_ohlcv(symbol, config.TF_MICRO, limit=100)
             df_m = pd.DataFrame(ohlcv_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df_m = self.calculate_indicators(df_m)
             
-            current_price = df_m.iloc[-1]['close']
-            atr_micro = df_m.iloc[-2]['ATR']
+            current_candle = df_m.iloc[-1]   # Candle Berjalan
+            last_closed_m = df_m.iloc[-2]    # Candle Close Terakhir
             
-            # --- HITUNG PERUBAHAN HARGA (Current vs Yesterday Close) ---
+            # 5. MICRO TREND ALIGNMENT (EMA 50 - 15m)
+            # Kembalikan fitur ini agar tidak entry saat koreksi tajam
+            micro_trend_ok = False
+            if bias == "BULLISH" and current_candle['close'] > current_candle['EMA_50']:
+                micro_trend_ok = True
+                score += 10
+            elif bias == "BEARISH" and current_candle['close'] < current_candle['EMA_50']:
+                micro_trend_ok = True
+                score += 10
+            
+            # Jika trend 15m berlawanan arah dengan Daily, kurangi skor drastis
+            if not micro_trend_ok: score -= 20 
+
+            # --- CALCULATIONS ---
+            # % Change (Daily)
             prev_daily_close = df_d.iloc[-2]['close']
-            pct_change = ((current_price - prev_daily_close) / prev_daily_close) * 100
+            pct_change = ((current_candle['close'] - prev_daily_close) / prev_daily_close) * 100
             
-            # Filter Score
-            if score < config.MIN_SCORE: return None
+            # Volume Ratio (Daily)
+            vol_mean = last_d['Vol_Mean_21'] if last_d['Vol_Mean_21'] > 0 else 1
+            vol_ratio = last_d['volume'] / vol_mean
             
-            # Stop Loss
+            # Stop Loss (Pakai ATR 15m agar SL tipis)
+            atr_micro = last_closed_m['ATR']
+            
             if bias == "BULLISH":
-                sl = current_price - (config.ATR_MULTIPLIER * atr_micro)
+                sl = current_candle['low'] - (config.ATR_MULTIPLIER * atr_micro)
                 side = "LONG 🟢"
             else:
-                sl = current_price + (config.ATR_MULTIPLIER * atr_micro)
+                sl = current_candle['high'] + (config.ATR_MULTIPLIER * atr_micro)
                 side = "SHORT 🔴"
 
+            # --- FINAL FILTER ---
+            if score < config.MIN_SCORE: return None
+            
             clean_symbol = symbol.replace('_', '/') 
             
             return {
                 'symbol': clean_symbol,
                 'side': side,
                 'score': score,
-                'price': current_price,
-                'chg': pct_change,             # <--- Data Baru (% Change)
+                'price': current_candle['close'],
+                'chg': pct_change,
                 'sl': sl,
-                'vol_ratio': last_d['volume'] / last_d['Vol_Mean_21'], # <--- Data Baru (Volume Ratio)
+                'vol_ratio': vol_ratio,
                 'adx': last_d['ADX'],
                 'cmf': last_d['CMF_21']
             }
@@ -140,7 +177,7 @@ class Screener:
 
     def run_scan(self):
         targets = self.get_top_pairs()
-        print(f"🔍 Scanning {len(targets)} Pairs with V6.1 Indicators...")
+        print(f"🔍 Scanning {len(targets)} Pairs (Hybrid: Daily DMI + 15m EMA)...")
         results = []
         with ThreadPoolExecutor(max_workers=5) as executor:
             futures = [executor.submit(self.analyze_pair, s) for s in targets]
