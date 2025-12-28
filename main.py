@@ -13,36 +13,42 @@ def send_telegram(msg):
         "disable_web_page_preview": True
     }
     try: requests.post(url, json=payload)
-    except: pass
+    except Exception as e: print(f"Tele Error: {e}")
 
 def main():
-    print("🚀 Starting 1H/4H Trend Screener...")
+    print("🚀 Starting Smart Flow Screener...")
+    
     bot = Screener()
     results = bot.run_scan()
     
-    # Header Pesan
-    msg = f"📡 **SIGNAL RADAR ({config.TF_TRADE.upper()})**\n"
-    msg += f"🕒 {pd.Timestamp.now().strftime('%H:%M UTC')}\n"
-    msg += "➖➖➖➖➖➖➖➖➖➖\n"
+    # Header Laporan
+    msg = f"⚡ **TRADE SIGNAL ({pd.Timestamp.now().strftime('%H:%M UTC')})** ⚡\n"
+    msg += f"Gate.io | Threshold: {config.MIN_SCORE}+\n"
+    msg += "-"*20 + "\n"
     
     if not results:
-        msg += "💤 **No High Probability Setups**\n"
-        msg += "Market is sideways or messy.\n"
-        print("⚠️ No results found.")
+        print("💤 Market Sepi. Kirim laporan status saja.")
+        msg += "💤 **No High Quality Setup**\n"
+        msg += "Analisa: Market sideway atau volume rendah.\n"
+        msg += "Bot tetap memantau... 👁️"
     else:
-        # Batasi cuma kirim Top 5 biar gak spam
-        top_results = results[:5] 
-        for r in top_results:
-            icon = "🔥" if r['score'] >= 90 else "⚡"
-            msg += f"{icon} **{r['symbol']}** [{r['side']}]\n"
-            msg += f"🏆 Score: **{r['score']}/100**\n"
-            msg += f"💰 Price: `{r['price']}`\n"
-            msg += f"📊 Candle Chg: {r['change_1h']}%\n"
-            msg += f"🌊 Vol Ratio: {r['vol_stat']}x\n"
-            msg += "➖➖➖➖➖➖➖➖➖➖\n"
+        top_picks = results[:10] # Ambil max 10 sinyal terbaik aja biar gak spam
+        for r in top_picks:
+            # Icon Setup
+            rank = "🔥" if r['score'] >= 80 else "✨" if r['score'] >= 65 else "⚠️"
+            
+            msg += f"{rank} **{r['symbol']}** {r['side']}\n"
+            msg += f"   🎯 Score: **{r['score']}/100**\n"
+            msg += f"   💰 Price: {r['price']}\n"
+            msg += f"   📊 Vol: {r['vol']:.1f}x\n"
+            msg += f"   🛡️ SL: `{r['sl']:.4f}`\n\n"
+            
+        msg += "💡 *Score > 80 = Super Strong Setup*"
     
+    print("✅ Mengirim ke Telegram...")
+    print(msg) # Print di log juga
     send_telegram(msg)
-    print("✅ Done.")
+    print("🏁 Done.")
 
 if __name__ == "__main__":
     main()
