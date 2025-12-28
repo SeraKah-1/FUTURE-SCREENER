@@ -1,22 +1,19 @@
 import os
 
-# --- TELEGRAM ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# --- EXCHANGE ---
-EXCHANGE_ID = 'gate'     # Gate.io (IP Safe)
-TOP_VOL_COUNT = 35       # Scan 35 Koin Terbesar
-TF_MACRO = '1h'          # Trend Utama
-TF_MICRO = '15m'         # Titik Entry
+# --- EXCHANGE: GATE.IO ---
+EXCHANGE_ID = 'gate' 
+TOP_VOL_COUNT = 40       # Scan 40 Koin Terbesar (Biar peluang lebih banyak)
+TF_MACRO = '1h'          # Trend Bias
+TF_MICRO = '15m'         # Entry Trigger
 
-# --- AMBANG BATAS (FILTER) ---
-MIN_SCORE = 60           # HANYA TAMPILKAN JIKA SCORE DI ATAS 60
-                         # Ubah jadi 50 jika ingin lebih banyak sinyal (tapi kualitas turun)
+# --- FILTER KUALITAS ---
+MIN_SCORE = 55           # Sinyal divalidasi jika skor > 55
+                         # (Angka 55 adalah Sweet Spot: Tidak terlalu ketat, tidak terlalu longgar)
 
 # --- INDIKATOR ---
-EMA_FAST = 21
-EMA_MID = 50
-EMA_SLOW = 200
+EMA_MID = 50             # Garis Trend Utama
 RSI_PERIOD = 14
-ATR_MULTIPLIER = 1.5     # Jarak Stop Loss (1.5x ATR)
+ATR_MULTIPLIER = 1.5     # Jarak Stop Loss
