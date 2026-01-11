@@ -5,7 +5,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 # --- EXCHANGE: GATE.IO ---
 EXCHANGE_ID = 'gate' 
-TOP_VOL_COUNT = 40       # Scan 40 Koin Terbesar (Biar peluang lebih banyak)
+TOP_VOL_COUNT = 80       # Scan 40 Koin Terbesar (Biar peluang lebih banyak)
 TF_MACRO = '1h'          # Trend Bias
 TF_MICRO = '15m'         # Entry Trigger
 
