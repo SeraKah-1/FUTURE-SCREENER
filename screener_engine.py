@@ -6,183 +6,164 @@ from concurrent.futures import ThreadPoolExecutor
 
 class Screener:
     def __init__(self):
-        print(f"🔌 Connecting to {config.EXCHANGE_ID}...")
+        print(f"🔌 Connecting to {config.EXCHANGE_ID} (Futures Radar Mode)...")
+        # Inisialisasi Exchange (Mode Swap/Futures)
         self.exchange = getattr(ccxt, config.EXCHANGE_ID)({
             'enableRateLimit': True,
             'options': {'defaultType': 'swap'} 
         })
 
+    def get_btc_mood(self):
+        """
+        [SATPAM PASAR]
+        Mengecek kondisi Bitcoin dalam 1 jam terakhir.
+        Return: Persentase perubahan harga (float).
+        """
+        try:
+            ohlcv = self.exchange.fetch_ohlcv('BTC/USDT', '1h', limit=2)
+            if not ohlcv or len(ohlcv) < 2: return 0.0
+            
+            open_price = ohlcv[0][1] # Open candle 1 jam lalu
+            close_price = ohlcv[-1][4] # Harga sekarang
+            
+            change = ((close_price - open_price) / open_price) * 100
+            return change
+        except Exception as e:
+            print(f"⚠️ Gagal cek BTC Mood: {e}")
+            return 0.0
+
     def get_top_pairs(self):
+        """
+        Ambil Top 80 Pair Volume Terbesar.
+        Filter: Buang Token Leverage (3L/3S/ETF).
+        """
         try:
             tickers = self.exchange.fetch_tickers()
             targets = []
+            
+            # Kata kunci token sampah/leverage yang harus dibuang
+            blacklist = ['3L', '3S', '5L', '5S', 'BEAR', 'BULL', 'HEGIC', 'DAI']
+
             for s, d in tickers.items():
+                # Syarat: Pair USDT dan Volume ada
                 if 'USDT' in s and d.get('quoteVolume') and float(d['quoteVolume']) > 0:
+                    # Cek Blacklist
+                    if any(x in s for x in blacklist):
+                        continue
                     targets.append((s, d['quoteVolume']))
+            
+            # Sortir dari volume terbesar
             targets = sorted(targets, key=lambda x: x[1], reverse=True)[:config.TOP_VOL_COUNT]
             return [t[0] for t in targets]
-        except Exception:
+        except Exception as e:
+            print(f"⚠️ Error getting pairs: {e}")
             return []
 
-    def calculate_indicators(self, df):
-        if df is None or df.empty: return None
-        
-        # --- 1. GENERAL INDICATORS ---
-        # EMA 50 (Untuk Micro Trend 15m)
-        df['EMA_50'] = df['close'].ewm(span=50).mean()
-        
-        # Volume Mean 21 (Untuk Daily Breakout)
-        df['Vol_Mean_21'] = df['volume'].rolling(21).mean()
-        
-        # RSI 21 (Smooth RSI)
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(21).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(21).mean()
-        rs = gain / loss
-        df['RSI_21'] = 100 - (100 / (1 + rs))
-        
-        # ATR 14 (Untuk Stop Loss)
-        high_low = df['high'] - df['low']
-        h_c = np.abs(df['high'] - df['close'].shift())
-        l_c = np.abs(df['low'] - df['close'].shift())
-        tr = np.max(pd.concat([high_low, h_c, l_c], axis=1), axis=1)
-        df['ATR'] = tr.rolling(14).mean()
-        
-        # --- 2. ADVANCED INDICATORS (Daily) ---
-        # CMF 21 (Chaikin Money Flow)
-        mfv = ((df['close'] - df['low']) - (df['high'] - df['close'])) / (df['high'] - df['low']) * df['volume']
-        # Handle division by zero
-        vol_sum = df['volume'].rolling(21).sum()
-        df['CMF_21'] = np.where(vol_sum == 0, 0, mfv.rolling(21).sum() / vol_sum)
-        
-        # DMI 14 (ADX, +DI, -DI)
-        up = df['high'].diff()
-        down = -df['low'].diff()
-        plus_dm = np.where((up > down) & (up > 0), up, 0)
-        minus_dm = np.where((down > up) & (down > 0), down, 0)
-        
-        tr_smooth = tr.rolling(14).mean()
-        # Hindari pembagian dengan 0
-        tr_smooth = tr_smooth.replace(0, np.nan) 
-        
-        # Perbaikan: Pastikan index selaras saat membuat Series
-        plus_di = 100 * (pd.Series(plus_dm, index=df.index).rolling(14).mean() / tr_smooth)
-        minus_di = 100 * (pd.Series(minus_dm, index=df.index).rolling(14).mean() / tr_smooth)
-        
-        sum_di = plus_di + minus_di
-        dx = 100 * np.abs(plus_di - minus_di) / sum_di.replace(0, np.nan)
-        df['ADX'] = dx.rolling(14).mean()
-        df['DI_Plus'] = plus_di
-        df['DI_Minus'] = minus_di
-        
-        return df
-
-    def analyze_pair(self, symbol):
+    def analyze_pair(self, symbol, btc_change):
         try:
-            # =========================================
-            # TAHAP 1: MACRO ANALYSIS (DAILY)
-            # =========================================
-            ohlcv_d = self.exchange.fetch_ohlcv(symbol, '1d', limit=100)
-            df_d = pd.DataFrame(ohlcv_d, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df_d = self.calculate_indicators(df_d)
-            last_d = df_d.iloc[-2] # Daily Close Kemarin
+            # 1. Ambil Data 15m (50 Candle)
+            ohlcv = self.exchange.fetch_ohlcv(symbol, config.TF_RADAR, limit=50)
+            if not ohlcv or len(ohlcv) < 50: return None
             
-            bias = "NEUTRAL"
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            
+            # --- LOGIKA INTELEJEN RADAR ---
+            
+            # A. Hitung Baseline Volume (Rata-rata 20 candle terakhir)
+            vol_mean = df['volume'].rolling(20).mean().iloc[-1]
+            current_vol = df['volume'].iloc[-1]
+            
+            # Hindari pembagian dengan nol
+            if vol_mean == 0: return None
+            
+            # B. Hitung RVOL (Relative Volume)
+            rvol = current_vol / vol_mean
+            
+            # GATEKEEPER 1: Kalau volume sepi (< 1.5x), langsung buang.
+            if rvol < config.MIN_RVOL: return None
+
+            # C. Analisa Harga & Arah
+            last = df.iloc[-1]
+            open_p = last['open']
+            close_p = last['close']
+            
+            # Persentase perubahan candle ini
+            change_pct = ((close_p - open_p) / open_p) * 100
+            abs_change = abs(change_pct)
+            
+            side = "LONG 🟢" if change_pct > 0 else "SHORT 🔴"
+            
+            # D. Analisa Trend Simpel (EMA 200) - Hanya Pendukung
+            ema_200 = df['close'].ewm(span=200).mean().iloc[-1]
+            trend_aligned = False
+            if (side == "LONG 🟢" and close_p > ema_200) or (side == "SHORT 🔴" and close_p < ema_200):
+                trend_aligned = True
+            
+            # --- TIERING SYSTEM (KELAS SINYAL) ---
+            tier = ""
+            if rvol > 5.0 and abs_change > 3.0:
+                tier = "👑 KING (Whale Alert)"
+            elif rvol > 2.5 and abs_change > 1.5:
+                tier = "🔥 HOT (Big Move)"
+            else:
+                tier = "✅ VALID (Activity)"
+
+            # --- SCORING (0-100) ---
             score = 0
+            # Poin Volume
+            score += min(rvol * 10, 50) # Max 50 poin dari volume
+            # Poin Volatilitas
+            score += min(abs_change * 10, 30) # Max 30 poin dari pergerakan harga
+            # Poin Trend
+            if trend_aligned: score += 20 # Bonus 20 poin jika searah EMA 200
             
-            # 1. DMI TREND FILTER (Syarat Utama)
-            # ADX > 20 artinya trend mulai terbentuk
-            if last_d['ADX'] > 20:
-                if last_d['DI_Plus'] > last_d['DI_Minus']:
-                    bias = "BULLISH"
-                    score += 30
-                elif last_d['DI_Minus'] > last_d['DI_Plus']:
-                    bias = "BEARISH"
-                    score += 30
-            else:
-                return None # Market Sideways / Tidak Jelas -> SKIP
-            
-            # 2. CMF MONEY FLOW (Konfirmasi Bandar)
-            if bias == "BULLISH" and last_d['CMF_21'] > 0: score += 15
-            elif bias == "BEARISH" and last_d['CMF_21'] < 0: score += 15
-            else: score -= 10 # Divergence (Harga naik tapi uang keluar)
+            score = int(score)
 
-            # 3. RSI 21 (Momentum Jangka Menengah)
-            if bias == "BULLISH" and last_d['RSI_21'] > 50: score += 10
-            elif bias == "BEARISH" and last_d['RSI_21'] < 50: score += 10
+            # --- BTC GUARD FILTER (SATPAM) ---
+            # Aturan: Jangan Long saat BTC Crash, Jangan Short saat BTC Pump.
+            # Pengecualian: Tier KING boleh lewat (karena anomali ekstrim).
+            
+            if "KING" not in tier:
+                if btc_change < config.BTC_CRASH_LIMIT and side == "LONG 🟢":
+                    return None # Blokir Long
+                if btc_change > config.BTC_PUMP_LIMIT and side == "SHORT 🔴":
+                    return None # Blokir Short
 
-            # 4. DAILY VOLUME BREAKOUT
-            if last_d['volume'] > last_d['Vol_Mean_21']: score += 10
-            
-            # =========================================
-            # TAHAP 2: MICRO ANALYSIS (15m)
-            # =========================================
-            ohlcv_15m = self.exchange.fetch_ohlcv(symbol, config.TF_MICRO, limit=100)
-            df_m = pd.DataFrame(ohlcv_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df_m = self.calculate_indicators(df_m)
-            
-            current_candle = df_m.iloc[-1]   # Candle Berjalan
-            last_closed_m = df_m.iloc[-2]    # Candle Close Terakhir
-            
-            # 5. MICRO TREND ALIGNMENT (EMA 50 - 15m)
-            # Kembalikan fitur ini agar tidak entry saat koreksi tajam
-            micro_trend_ok = False
-            if bias == "BULLISH" and current_candle['close'] > current_candle['EMA_50']:
-                micro_trend_ok = True
-                score += 10
-            elif bias == "BEARISH" and current_candle['close'] < current_candle['EMA_50']:
-                micro_trend_ok = True
-                score += 10
-            
-            # Jika trend 15m berlawanan arah dengan Daily, kurangi skor drastis
-            if not micro_trend_ok: score -= 20 
-
-            # --- CALCULATIONS ---
-            # % Change (Daily)
-            prev_daily_close = df_d.iloc[-2]['close']
-            pct_change = ((current_candle['close'] - prev_daily_close) / prev_daily_close) * 100
-            
-            # Volume Ratio (Daily)
-            vol_mean = last_d['Vol_Mean_21'] if last_d['Vol_Mean_21'] > 0 else 1
-            vol_ratio = last_d['volume'] / vol_mean
-            
-            # Stop Loss (Pakai ATR 15m agar SL tipis)
-            atr_micro = last_closed_m['ATR']
-            
-            if bias == "BULLISH":
-                sl = current_candle['low'] - (config.ATR_MULTIPLIER * atr_micro)
-                side = "LONG 🟢"
-            else:
-                sl = current_candle['high'] + (config.ATR_MULTIPLIER * atr_micro)
-                side = "SHORT 🔴"
-
-            # --- FINAL FILTER ---
-            if score < config.MIN_SCORE: return None
-            
-            clean_symbol = symbol.replace('_', '/') 
+            # Format Nama Simbol (BTC_USDT -> BTC/USDT)
+            clean_symbol = symbol.replace('_', '/')
             
             return {
                 'symbol': clean_symbol,
                 'side': side,
+                'tier': tier,
                 'score': score,
-                'price': current_candle['close'],
-                'chg': pct_change,
-                'sl': sl,
-                'vol_ratio': vol_ratio,
-                'adx': last_d['ADX'],
-                'cmf': last_d['CMF_21']
+                'price': close_p,
+                'chg': change_pct,
+                'rvol': rvol,
+                'trend': "Follow Trend" if trend_aligned else "Counter Trend ⚠️"
             }
+
         except Exception:
             return None
 
     def run_scan(self):
-        targets = self.get_top_pairs()
-        print(f"🔍 Scanning {len(targets)} Pairs (Hybrid: Daily DMI + 15m EMA)...")
-        results = []
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = [executor.submit(self.analyze_pair, s) for s in targets]
-            for f in futures:
-                if f.result(): results.append(f.result())
+        # 1. Cek BTC dulu
+        btc_change = self.get_btc_mood()
+        btc_status = "BEARISH 🐻" if btc_change < -0.5 else ("BULLISH 🐮" if btc_change > 0.5 else "SIDEWAYS 🦀")
+        print(f"🌍 Market Mood: BTC is {btc_status} ({btc_change:+.2f}%)")
         
-        results.sort(key=lambda x: -x['score'])
-        return results
+        # 2. Ambil Daftar Koin
+        targets = self.get_top_pairs()
+        print(f"🔍 Radar Scanning {len(targets)} Pairs (15m Volume Anomaly)...")
+        
+        results = []
+        # 3. Multithreading Scan
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            # Kita lempar btc_change ke dalam fungsi agar setiap pair "sadar" kondisi market
+            futures = [executor.submit(self.analyze_pair, s, btc_change) for s in targets]
+            for f in futures:
+                res = f.result()
+                if res: results.append(res)
+        
+        # Sortir hasil berdasarkan Score tertinggi
+        return sorted(results, key=lambda x: x['score'], reverse=True)
