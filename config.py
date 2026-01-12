@@ -1,19 +1,15 @@
 import os
 
+# --- TELEGRAM CONFIG ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# --- EXCHANGE: GATE.IO ---
-EXCHANGE_ID = 'gate' 
-TOP_VOL_COUNT = 80       # Scan 40 Koin Terbesar (Biar peluang lebih banyak)
-TF_MACRO = '1h'          # Trend Bias
-TF_MICRO = '15m'         # Entry Trigger
+# --- EXCHANGE SETTINGS ---
+EXCHANGE_ID = 'gate'     # Menggunakan Gate.io
+TOP_VOL_COUNT = 100       # Scan 80 Koin dengan Volume Terbesar
+TF_RADAR = '15m'         # Timeframe Wajib untuk Radar
 
-# --- FILTER KUALITAS ---
-MIN_SCORE = 70           # Sinyal divalidasi jika skor > 55
-                         # (Angka 55 adalah Sweet Spot: Tidak terlalu ketat, tidak terlalu longgar)
-
-# --- INDIKATOR ---
-EMA_MID = 50             # Garis Trend Utama
-RSI_PERIOD = 14
-ATR_MULTIPLIER = 1.5     # Jarak Stop Loss
+# --- THRESHOLD (BATAS AMBANG) ---
+MIN_RVOL = 1.5           # Minimal Volume 1.5x dari rata-rata untuk dilirik
+BTC_CRASH_LIMIT = -1.0   # Batas BTC Crash (%) untuk memblokir sinyal Long
+BTC_PUMP_LIMIT = 1.0     # Batas BTC Pump (%) untuk memblokir sinyal Short
